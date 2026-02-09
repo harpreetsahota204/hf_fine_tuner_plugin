@@ -1,0 +1,16 @@
+name: "@harpreetsahota/hf_fine_tuner_plugin"
+type: plugin
+description: Fine-tune HuggingFace vision models directly from the FiftyOne App
+version: 0.1.0
+url: "https://github.com/harpreetsahota204/hf_fine_tuner_plugin"
+author: "Harpreet Sahota"
+license: Apache 2.0
+
+fiftyone:
+  version: ">=1.0"
+operators:
+  - finetune_classification
+  - finetune_detection
+  - finetune_segmentation
+secrets:
+  - HF_TOKEN
