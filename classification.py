@@ -200,11 +200,24 @@ class FinetuneClassification(foo.Operator):
             choose_button_label="Accept",
         )
         inputs.file(
-            "output_dir",
+            "output_parent_dir",
             required=True,
-            label="Output Directory",
-            description="Directory where the fine-tuned model will be saved",
+            label="Output Parent Directory",
+            description=(
+                "Parent directory where a new model folder "
+                "will be created"
+            ),
             view=file_explorer,
+        )
+        inputs.str(
+            "model_dir_name",
+            required=True,
+            label="Model Folder Name",
+            description=(
+                "Name for the new model directory "
+                "(will be created if it doesn't exist)"
+            ),
+            default="finetuned_classification_model",
         )
 
         inputs.bool(
@@ -224,6 +237,13 @@ class FinetuneClassification(foo.Operator):
                 required=True,
                 label="Hub Model ID",
                 description="Repository ID on the Hub, e.g. your-username/model-name",
+            )
+            inputs.bool(
+                "hub_private",
+                default=True,
+                label="Private Repository",
+                description="Make the Hub repository private",
+                view=types.CheckboxView(),
             )
 
         return types.Property(
@@ -253,15 +273,20 @@ class FinetuneClassification(foo.Operator):
             else None
         )
 
+        # Build output_dir from parent + model folder name.
         # FileExplorerView returns {"absolute_path": "..."} from the App;
-        # SDK callers pass a plain string.
-        raw_output_dir = ctx.params.get("output_dir", "./finetuned_model")
-        if isinstance(raw_output_dir, dict):
-            output_dir = raw_output_dir.get(
-                "absolute_path", "./finetuned_model"
-            )
+        # SDK callers pass a plain string via __call__.
+        raw_parent = ctx.params.get("output_parent_dir", ".")
+        if isinstance(raw_parent, dict):
+            parent_dir = raw_parent.get("absolute_path", ".")
         else:
-            output_dir = raw_output_dir
+            parent_dir = raw_parent
+
+        model_dir_name = ctx.params.get(
+            "model_dir_name", "finetuned_classification_model",
+        )
+        output_dir = os.path.join(parent_dir, model_dir_name)
+        os.makedirs(output_dir, exist_ok=True)
 
         return self._run_training(
             target_view=ctx.target_view(),
@@ -277,6 +302,7 @@ class FinetuneClassification(foo.Operator):
             output_dir=output_dir,
             push_to_hub=ctx.params.get("push_to_hub", False),
             hub_model_id=ctx.params.get("hub_model_id"),
+            hub_private=ctx.params.get("hub_private", True),
             hub_token=hub_token,
         )
 
@@ -297,6 +323,7 @@ class FinetuneClassification(foo.Operator):
         output_dir="./finetuned_model",
         push_to_hub=False,
         hub_model_id=None,
+        hub_private=True,
         hub_token=None,
     ):
         """Run the full fine-tuning pipeline.
@@ -458,6 +485,7 @@ class FinetuneClassification(foo.Operator):
             remove_unused_columns=False,
             push_to_hub=push_to_hub,
             hub_model_id=hub_model_id if push_to_hub else None,
+            hub_private_repo=hub_private,
             hub_token=hub_token,
             logging_steps=10,
             fp16=torch.cuda.is_available(),
@@ -579,9 +607,10 @@ class FinetuneClassification(foo.Operator):
         num_epochs=3,
         batch_size=8,
         learning_rate=5e-5,
-        output_dir="./finetuned_model",
+        output_dir="./finetuned_classification_model",
         push_to_hub=False,
         hub_model_id=None,
+        hub_private=True,
         delegate=False,
     ):
         """Execute fine-tuning via the SDK through the operator framework.
@@ -615,6 +644,8 @@ class FinetuneClassification(foo.Operator):
             push_to_hub: whether to push to HuggingFace Hub.
             hub_model_id: Hub repository ID (required when *push_to_hub*
                 is ``True``).
+            hub_private: whether the Hub repository should be private
+                (default ``True``).
             delegate: whether to schedule as a delegated operation
                 (default ``False`` — runs immediately). Set to ``True``
                 to run in the background via an orchestrator.
@@ -623,10 +654,13 @@ class FinetuneClassification(foo.Operator):
             an :class:`ExecutionResult`, or an ``asyncio.Task`` in
             notebook contexts.
         """
-        # inputs.file() expects {"absolute_path": "..."} — wrap plain
-        # strings so the framework's validator doesn't choke.
-        if isinstance(output_dir, str):
-            output_dir = {"absolute_path": os.path.abspath(output_dir)}
+        # Split output_dir into parent + folder name so the params
+        # match what execute() reads from the App form.
+        abs_path = os.path.abspath(output_dir)
+        output_parent_dir = {
+            "absolute_path": os.path.dirname(abs_path),
+        }
+        model_dir_name = os.path.basename(abs_path)
 
         params = dict(
             label_field=label_field,
@@ -638,9 +672,11 @@ class FinetuneClassification(foo.Operator):
             num_epochs=num_epochs,
             batch_size=batch_size,
             learning_rate=learning_rate,
-            output_dir=output_dir,
+            output_parent_dir=output_parent_dir,
+            model_dir_name=model_dir_name,
             push_to_hub=push_to_hub,
             hub_model_id=hub_model_id,
+            hub_private=hub_private,
         )
 
         ctx = dict(view=sample_collection.view())
