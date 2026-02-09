@@ -1,0 +1,7 @@
+fiftyone
+torch
+transformers
+timm
+Pillow
+numpy
+accelerate
