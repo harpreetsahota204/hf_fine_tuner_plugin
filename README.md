@@ -28,20 +28,10 @@ programmatically via the Python SDK.
 ## Installation
 
 ```bash
-# Clone the plugin
-git clone https://github.com/harpreetsahota204/hf_fine_tuner_plugin.git
-
-# Copy to your FiftyOne plugins directory
-cp -r hf_fine_tuner_plugin $(python -c "import fiftyone as fo; print(fo.config.plugins_dir)")
-
-# Install dependencies
-pip install -r hf_fine_tuner_plugin/requirements.txt
-```
-
-Or install directly via the FiftyOne CLI:
-
-```bash
 fiftyone plugins download https://github.com/harpreetsahota204/hf_fine_tuner_plugin
+
+# Install any requirements for the plugin
+fiftyone plugins requirements @harpreetsahota/hf_fine_tuner_plugin --install
 ```
 
 ## Secrets
