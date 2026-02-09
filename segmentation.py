@@ -337,7 +337,14 @@ class FinetuneSegmentation(foo.Operator):
 
     def execute(self, ctx):
         """App execution path — extracts params from ctx, delegates to
-        ``_run_training``."""
+        ``_run_training``.
+
+        The ``StopIteration`` guard is required because FiftyOne's
+        delegated executor wraps ``execute()`` in an asyncio Future,
+        and ``StopIteration`` cannot be set as a Future exception.
+        A ``StopIteration`` can leak from the HuggingFace Trainer's
+        internal DataLoader iteration at epoch boundaries.
+        """
         hub_token = (
             ctx.secrets.get("HF_TOKEN")
             if ctx.params.get("push_to_hub")
@@ -359,27 +366,36 @@ class FinetuneSegmentation(foo.Operator):
         output_dir = os.path.join(parent_dir, model_dir_name)
         os.makedirs(output_dir, exist_ok=True)
 
-        return self._run_training(
-            target_view=ctx.target_view(),
-            label_field=ctx.params["label_field"],
-            model_name=ctx.params["model_name"],
-            do_reduce_labels=ctx.params.get("do_reduce_labels", False),
-            num_classes_override=ctx.params.get("num_classes"),
-            split_strategy=ctx.params.get(
-                "split_strategy", "percentage",
-            ),
-            train_split=ctx.params.get("train_split", 0.8),
-            train_tag=ctx.params.get("train_tag", "train"),
-            val_tag=ctx.params.get("val_tag", "val"),
-            num_epochs=ctx.params.get("num_epochs", 50),
-            batch_size=ctx.params.get("batch_size", 2),
-            learning_rate=ctx.params.get("learning_rate", 6e-5),
-            output_dir=output_dir,
-            push_to_hub=ctx.params.get("push_to_hub", False),
-            hub_model_id=ctx.params.get("hub_model_id"),
-            hub_private=ctx.params.get("hub_private", True),
-            hub_token=hub_token,
-        )
+        try:
+            return self._run_training(
+                target_view=ctx.target_view(),
+                label_field=ctx.params["label_field"],
+                model_name=ctx.params["model_name"],
+                do_reduce_labels=ctx.params.get(
+                    "do_reduce_labels", False,
+                ),
+                num_classes_override=ctx.params.get("num_classes"),
+                split_strategy=ctx.params.get(
+                    "split_strategy", "percentage",
+                ),
+                train_split=ctx.params.get("train_split", 0.8),
+                train_tag=ctx.params.get("train_tag", "train"),
+                val_tag=ctx.params.get("val_tag", "val"),
+                num_epochs=ctx.params.get("num_epochs", 50),
+                batch_size=ctx.params.get("batch_size", 2),
+                learning_rate=ctx.params.get("learning_rate", 6e-5),
+                output_dir=output_dir,
+                push_to_hub=ctx.params.get("push_to_hub", False),
+                hub_model_id=ctx.params.get("hub_model_id"),
+                hub_private=ctx.params.get("hub_private", True),
+                hub_token=hub_token,
+            )
+        except StopIteration as e:
+            raise RuntimeError(
+                "Training iteration ended unexpectedly. This can "
+                "happen when the HuggingFace Trainer's DataLoader "
+                "raises StopIteration across an async boundary."
+            ) from e
 
     # ---- core training logic ----------------------------------------------
 
