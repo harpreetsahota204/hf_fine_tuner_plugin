@@ -345,6 +345,13 @@ class FinetuneClassification(foo.Operator):
         This method contains all the training logic and is called by both
         ``execute()`` (App / delegated path) and ``__call__()`` (SDK path).
         """
+        # Force single-GPU training to avoid DataParallel.  The HF Trainer
+        # wraps models in nn.DataParallel when it sees multiple GPUs, which
+        # breaks models whose forward() calls self.device (e.g. DETR) and
+        # is slow in general.  For proper multi-GPU, use accelerate/DDP.
+        if "CUDA_VISIBLE_DEVICES" not in os.environ:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
         # Heavy imports deferred to execution time
         import json
 
