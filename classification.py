@@ -59,25 +59,14 @@ class FinetuneClassification(foo.Operator):
             name="finetune_classification",
             label="Fine-tune Classification Model",
             description=(
-                "Fine-tune any HuggingFace image-classification model "
+                "Fine-tune any HuggingFace AutoModelForClassification "
                 "on your FiftyOne dataset"
             ),
+            icon="/icons/adjust-svgrepo-com.svg",
             dynamic=True,
             # Allow both paths: immediate for SDK, delegated for App
             allow_immediate_execution=True,
             allow_delegated_execution=True,
-        )
-
-    # ---- placement --------------------------------------------------------
-
-    def resolve_placement(self, ctx):
-        return types.Placement(
-            types.Places.SAMPLES_GRID_SECONDARY_ACTIONS,
-            types.Button(
-                label="Fine-tune Classification",
-                icon="/icons/adjust-svgrepo-com.svg",
-                prompt=True,
-            ),
         )
 
     # ---- dynamic input form -----------------------------------------------

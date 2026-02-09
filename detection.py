@@ -129,21 +129,10 @@ class FinetuneDetection(foo.Operator):
                 "Fine-tune any HuggingFace AutoModelForObjectDetection model "
                 "on your FiftyOne dataset"
             ),
+            icon="/icons/adjust-svgrepo-com.svg",
             dynamic=True,
             allow_immediate_execution=True,
             allow_delegated_execution=True,
-        )
-
-    # ---- placement --------------------------------------------------------
-
-    def resolve_placement(self, ctx):
-        return types.Placement(
-            types.Places.SAMPLES_GRID_SECONDARY_ACTIONS,
-            types.Button(
-                label="Fine-tune Detection",
-                icon="/icons/adjust-svgrepo-com.svg",
-                prompt=True,
-            ),
         )
 
     # ---- dynamic input form -----------------------------------------------
