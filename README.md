@@ -59,6 +59,7 @@ in the operator browser or the grid actions menu.
 ## Usage — SDK
 
 ### Classification
+![image](icons/ft_classification.gif)
 
 ```python
 import fiftyone as fo
@@ -85,6 +86,7 @@ classification_trainer(
 ```
 
 ### Object Detection
+![image](icons/ft_detection.gif)
 
 ```python
 import fiftyone as fo
