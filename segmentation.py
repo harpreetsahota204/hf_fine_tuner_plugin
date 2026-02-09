@@ -282,7 +282,7 @@ class FinetuneSegmentation(foo.Operator):
             label="Fine-tune Segmentation Model",
             description=(
                 "Fine-tune any HuggingFace "
-                "AutoModelForSemanticSegmentation model "
+                "`AutoModelForSemanticSegmentation` model "
                 "on your FiftyOne dataset"
             ),
             icon="/icons/adjust-svgrepo-com.svg",

@@ -126,7 +126,7 @@ class FinetuneDetection(foo.Operator):
             name="finetune_detection",
             label="Fine-tune Detection Model",
             description=(
-                "Fine-tune any HuggingFace AutoModelForObjectDetection model "
+                "Fine-tune any HuggingFace `AutoModelForObjectDetection` model "
                 "on your FiftyOne dataset"
             ),
             icon="/icons/adjust-svgrepo-com.svg",

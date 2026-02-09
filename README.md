@@ -13,7 +13,7 @@ programmatically via the Python SDK.
 
 ## Features
 
-- Fine-tune any compatible HuggingFace model on your FiftyOne dataset
+- Fine-tune any compatible HuggingFace model (ie, `AutoModelForImageClassification` or `AutoModelForObjectDetection`) on your FiftyOne dataset
 - Train/val splitting via percentage or existing sample tags
 - Background (delegated) execution so the App stays responsive
 - Optional push to HuggingFace Hub (private repos by default)
