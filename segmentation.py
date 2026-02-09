@@ -7,12 +7,36 @@ This operator supports:
 - Optional push to HuggingFace Hub
 - SDK invocation via ``__call__``
 
-The FiftyOne-to-PyTorch conversion follows the standard pattern:
+Supported label field types
+---------------------------
+
+**``fiftyone.core.labels.Segmentation``** — semantic masks stored as:
+
+- *In-memory* ``mask`` arrays (uint8 ``(H, W)`` of class indices) stored
+  directly in the database.
+- *On-disk* images referenced by ``mask_path`` (added in FiftyOne 0.19).
+  Accepted on-disk formats:
+
+  - 2-D 8-bit or 16-bit grayscale (pixel values are class indices).
+  - Palette-mode PNGs (e.g. Pascal VOC) — pixel values are class indices.
+  - 3-D 8-bit RGB masks — each unique colour is mapped to a contiguous
+    class index automatically (with a log warning so you can verify).
+
+**``fiftyone.core.labels.Detections``** — instance segmentation stored as
+``fo.Detection`` objects with per-instance ``mask`` arrays inside an
+``fo.Detections`` field.  At training time, the per-instance masks are
+composited into a single semantic mask (``(H, W)`` of class indices) using
+the detection ``label`` values.  Detections without a ``mask`` fall back to
+bounding-box filling.  A ``background`` class at index 0 is added
+automatically.
+
+FiftyOne-to-PyTorch conversion
+-------------------------------
 
 1. Subclass ``fiftyone.utils.torch.GetItem`` to define what fields to
    extract (``required_keys``) and how to transform them (``__call__``).
 2. Use ``field_mapping`` so the GetItem uses a generic key
-   (``"segmentation"``) while the actual field name can vary.
+   (``"label_data"``) while the actual field name can vary.
 3. Call ``view.to_torch(get_item)`` to produce a PyTorch Dataset.
 
 Semantic segmentation works at the **image level** — each sample has a
@@ -34,9 +58,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _get_segmentation_fields(ctx):
-    """Return the names of all Segmentation label fields on the dataset."""
-    fields = []
+def _get_segmentation_compatible_fields(ctx):
+    """Return fields suitable for semantic-segmentation training.
+
+    Detects both ``fiftyone.core.labels.Segmentation`` fields (semantic
+    masks) and ``fiftyone.core.labels.Detections`` fields (instance
+    masks that will be composited into semantic masks during training).
+
+    Returns:
+        dict: mapping of field name to label-type string
+        (``"Segmentation"`` or ``"Detections"``).
+    """
+    fields = {}
     for name, field in ctx.dataset.get_field_schema().items():
         if hasattr(field, "document_type"):
             fqn = (
@@ -44,8 +77,30 @@ def _get_segmentation_fields(ctx):
                 f".{field.document_type.__name__}"
             )
             if fqn == "fiftyone.core.labels.Segmentation":
-                fields.append(name)
+                fields[name] = "Segmentation"
+            elif fqn == "fiftyone.core.labels.Detections":
+                fields[name] = "Detections"
     return fields
+
+
+def _get_field_type(dataset, label_field):
+    """Determine the label type for a given field name.
+
+    Returns ``"Segmentation"``, ``"Detections"``, or ``None``.
+    """
+    schema = dataset.get_field_schema()
+    field = schema.get(label_field)
+    if field is None or not hasattr(field, "document_type"):
+        return None
+    fqn = (
+        f"{field.document_type.__module__}"
+        f".{field.document_type.__name__}"
+    )
+    if fqn == "fiftyone.core.labels.Segmentation":
+        return "Segmentation"
+    if fqn == "fiftyone.core.labels.Detections":
+        return "Detections"
+    return None
 
 
 def _get_mask_targets(ctx, label_field):
@@ -64,6 +119,152 @@ def _get_mask_targets(ctx, label_field):
         mask_targets = ctx.dataset.default_mask_targets or None
 
     return mask_targets
+
+
+def _load_mask_from_segmentation(seg_obj):
+    """Extract the class-index mask array from a ``Segmentation`` label.
+
+    Handles both in-memory masks (``seg_obj.mask``) and on-disk masks
+    (``seg_obj.mask_path``).  Multi-channel masks loaded from disk are
+    reduced to a single-channel class-index array.
+
+    Returns:
+        numpy.ndarray: 2-D array of integer class indices ``(H, W)``.
+
+    Raises:
+        ValueError: if neither ``mask`` nor ``mask_path`` is available.
+    """
+    import numpy as np
+    from PIL import Image as _PILImage
+
+    mask = seg_obj.mask
+    if mask is not None:
+        if mask.ndim == 3:
+            mask = _collapse_multichannel_mask(mask)
+        return mask
+
+    mask_path = getattr(seg_obj, "mask_path", None)
+    if mask_path is None:
+        raise ValueError(
+            "Segmentation label has neither a 'mask' array nor a "
+            "'mask_path'.  Cannot load mask data."
+        )
+
+    mask_img = _PILImage.open(mask_path)
+
+    # Palette-mode PNGs (e.g. Pascal VOC) — pixel values are already
+    # class indices; do NOT convert to RGB.
+    if mask_img.mode == "P":
+        return np.array(mask_img)
+
+    mask = np.array(mask_img)
+
+    if mask.ndim == 2:
+        return mask
+
+    return _collapse_multichannel_mask(mask)
+
+
+def _collapse_multichannel_mask(mask):
+    """Reduce a 3-D ``(H, W, C)`` mask to 2-D class indices.
+
+    Strategy:
+      1. Single channel → squeeze.
+      2. All RGB channels identical → use the first channel.
+      3. Otherwise → encode each unique RGB colour as a contiguous
+         integer index.  (A warning is logged so the caller can verify
+         the mapping is consistent with their class labels.)
+    """
+    import numpy as np
+
+    if mask.shape[2] == 1:
+        return mask[:, :, 0]
+
+    rgb = mask[:, :, :3]
+
+    if (
+        np.array_equal(rgb[:, :, 0], rgb[:, :, 1])
+        and np.array_equal(rgb[:, :, 0], rgb[:, :, 2])
+    ):
+        return rgb[:, :, 0]
+
+    # Encode each unique colour as a flat 32-bit int
+    flat = (
+        rgb[:, :, 0].astype(np.int32) * 65536
+        + rgb[:, :, 1].astype(np.int32) * 256
+        + rgb[:, :, 2].astype(np.int32)
+    )
+    unique_vals, inverse = np.unique(flat, return_inverse=True)
+    logger.warning(
+        "RGB segmentation mask detected with %d unique colours.  "
+        "Mapping to contiguous class indices 0..%d.  Verify that "
+        "this is consistent with your class mapping.",
+        len(unique_vals),
+        len(unique_vals) - 1,
+    )
+    return inverse.reshape(mask.shape[:2]).astype(np.int64)
+
+
+def _detections_to_semantic_mask(detections, image_hw, label2id):
+    """Composite a list of ``Detection`` objects into a semantic mask.
+
+    Each detection's per-instance mask (or bounding box, if no mask is
+    present) is painted onto a canvas at the class index looked up
+    from *label2id*.  Later detections overwrite earlier ones at
+    overlapping pixels.
+
+    Args:
+        detections: list of ``fiftyone.core.labels.Detection``.
+        image_hw: ``(H, W)`` of the full image.
+        label2id: ``dict`` mapping class name → integer index.
+
+    Returns:
+        numpy.ndarray: ``(H, W)`` int64 array of class indices.
+            Index 0 is background (no detection coverage).
+    """
+    import numpy as np
+    from PIL import Image as _PILImage
+
+    h, w = image_hw
+    canvas = np.zeros((h, w), dtype=np.int64)
+
+    for det in detections:
+        cls_idx = label2id.get(det.label)
+        if cls_idx is None:
+            continue
+
+        x, y, bw, bh = det.bounding_box  # relative coords [0, 1]
+        x1 = max(int(round(x * w)), 0)
+        y1 = max(int(round(y * h)), 0)
+        x2 = min(int(round((x + bw) * w)), w)
+        y2 = min(int(round((y + bh) * h)), h)
+
+        box_h, box_w = y2 - y1, x2 - x1
+        if box_h <= 0 or box_w <= 0:
+            continue
+
+        det_mask = det.mask
+        if det_mask is not None:
+            # det.mask is (box_h, box_w) boolean/uint8 within the bbox.
+            # Resize if it doesn't match the absolute bbox dimensions.
+            if det_mask.shape != (box_h, box_w):
+                mask_img = _PILImage.fromarray(
+                    det_mask.astype(np.uint8) * 255,
+                )
+                mask_img = mask_img.resize(
+                    (box_w, box_h),
+                    _PILImage.NEAREST,
+                )
+                det_mask = np.array(mask_img) > 0
+            else:
+                det_mask = det_mask > 0
+
+            canvas[y1:y2, x1:x2][det_mask] = cls_idx
+        else:
+            # No instance mask — fill entire bounding box.
+            canvas[y1:y2, x1:x2] = cls_idx
+
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -95,17 +296,30 @@ class FinetuneSegmentation(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
 
-        # -- Label field (auto-detect Segmentation fields) ------------------
-        segmentation_fields = _get_segmentation_fields(ctx)
+        inputs.view(
+            "experimental_warning",
+            types.Warning(
+                label="Experimental",
+                description=(
+                    "Semantic segmentation fine-tuning is experimental. "
+                    "Results may vary depending on your dataset and "
+                    "model combination. Please report any issues."
+                ),
+            ),
+        )
 
-        if not segmentation_fields:
+        # -- Label field (auto-detect compatible fields) --------------------
+        compatible_fields = _get_segmentation_compatible_fields(ctx)
+
+        if not compatible_fields:
             inputs.view(
                 "no_fields_warning",
                 types.Warning(
-                    label="No segmentation fields found",
+                    label="No compatible fields found",
                     description=(
-                        "Your dataset needs at least one field of type "
-                        "fiftyone.core.labels.Segmentation"
+                        "Your dataset needs at least one field of "
+                        "type fiftyone.core.labels.Segmentation or "
+                        "fiftyone.core.labels.Detections"
                     ),
                 ),
             )
@@ -114,12 +328,19 @@ class FinetuneSegmentation(foo.Operator):
                 view=types.View(label="Fine-tune Segmentation"),
             )
 
+        # Build display labels so the user can see the field type
+        field_choices = list(compatible_fields.keys())
+
         inputs.enum(
             "label_field",
-            values=segmentation_fields,
+            values=field_choices,
             required=True,
             label="Label Field",
-            description="The Segmentation field to train on",
+            description=(
+                "Segmentation or Detections field to train on. "
+                "Detections fields will be composited into per-pixel "
+                "semantic masks automatically."
+            ),
         )
 
         label_field = ctx.params.get("label_field")
@@ -129,46 +350,92 @@ class FinetuneSegmentation(foo.Operator):
                 view=types.View(label="Fine-tune Segmentation"),
             )
 
-        # Show mask targets info
-        mask_targets = _get_mask_targets(ctx, label_field)
-        if mask_targets:
-            num_classes = len(mask_targets)
-            preview_items = list(mask_targets.items())[:10]
-            preview = ", ".join(
-                f"{v} ({k})" for k, v in preview_items
-            )
-            if num_classes > 10:
-                preview += f" ... (+{num_classes - 10} more)"
+        field_type = compatible_fields.get(label_field)
 
-            inputs.view(
-                "class_info",
-                types.Notice(
-                    label=f"Found {num_classes} classes: {preview}",
-                ),
+        # -- Class info (depends on field type) -----------------------------
+        if field_type == "Detections":
+            # Discover classes from the detection labels
+            distinct_labels = sorted(
+                ctx.dataset.distinct(
+                    f"{label_field}.detections.label",
+                )
             )
-        else:
-            inputs.view(
-                "no_targets_warning",
-                types.Warning(
-                    label="No mask_targets found",
-                    description=(
-                        "Your dataset has no mask_targets set for "
-                        f"'{label_field}'. You must provide "
-                        "num_classes manually, and pixel values in "
-                        "the mask will be used as class indices "
-                        "directly."
+            if distinct_labels:
+                num_classes = len(distinct_labels) + 1  # +1 background
+                preview = ", ".join(distinct_labels[:10])
+                if len(distinct_labels) > 10:
+                    preview += (
+                        f" ... (+{len(distinct_labels) - 10} more)"
+                    )
+
+                inputs.view(
+                    "class_info",
+                    types.Notice(
+                        label=(
+                            f"Detections field — found "
+                            f"{len(distinct_labels)} class(es): "
+                            f"{preview}.  A 'background' class will "
+                            f"be added at index 0 "
+                            f"({num_classes} total)."
+                        ),
                     ),
-                ),
-            )
-            inputs.int(
-                "num_classes",
-                required=True,
-                label="Number of Classes",
-                description=(
-                    "Total number of semantic classes in your masks "
-                    "(including background if applicable)"
-                ),
-            )
+                )
+            else:
+                inputs.view(
+                    "no_labels_warning",
+                    types.Warning(
+                        label="No detection labels found",
+                        description=(
+                            f"Field '{label_field}' has no "
+                            "detections with labels."
+                        ),
+                    ),
+                )
+        else:
+            # Segmentation field — use mask_targets as before
+            mask_targets = _get_mask_targets(ctx, label_field)
+            if mask_targets:
+                num_classes = len(mask_targets)
+                preview_items = list(mask_targets.items())[:10]
+                preview = ", ".join(
+                    f"{v} ({k})" for k, v in preview_items
+                )
+                if num_classes > 10:
+                    preview += (
+                        f" ... (+{num_classes - 10} more)"
+                    )
+
+                inputs.view(
+                    "class_info",
+                    types.Notice(
+                        label=(
+                            f"Found {num_classes} classes: {preview}"
+                        ),
+                    ),
+                )
+            else:
+                inputs.view(
+                    "no_targets_warning",
+                    types.Warning(
+                        label="No mask_targets found",
+                        description=(
+                            "Your dataset has no mask_targets set "
+                            f"for '{label_field}'. You must provide "
+                            "num_classes manually, and pixel values "
+                            "in the mask will be used as class "
+                            "indices directly."
+                        ),
+                    ),
+                )
+                inputs.int(
+                    "num_classes",
+                    required=True,
+                    label="Number of Classes",
+                    description=(
+                        "Total number of semantic classes in your "
+                        "masks (including background if applicable)"
+                    ),
+                )
 
         # -- Model name -----------------------------------------------------
         inputs.str(
@@ -448,32 +715,69 @@ class FinetuneSegmentation(foo.Operator):
 
         output_dir = os.path.expanduser(output_dir)
 
-        # -- 1. Build class mapping -----------------------------------------
+        # -- 1. Detect field type and build class mapping -------------------
         logger.info("Building class mapping...")
 
-        # Try to get mask_targets from the dataset
-        mask_targets = None
         dataset = target_view._dataset
-        if dataset.mask_targets:
-            mask_targets = dataset.mask_targets.get(label_field)
-        if mask_targets is None:
-            mask_targets = dataset.default_mask_targets or None
+        field_type = _get_field_type(dataset, label_field)
 
-        if mask_targets:
-            # mask_targets is {pixel_value: class_name}
-            id2label = {int(k): v for k, v in mask_targets.items()}
-            label2id = {v: int(k) for k, v in mask_targets.items()}
-            num_labels = len(mask_targets)
-        elif num_classes_override:
-            num_labels = num_classes_override
-            id2label = {i: str(i) for i in range(num_labels)}
-            label2id = {str(i): i for i in range(num_labels)}
-        else:
+        if field_type is None:
             raise ValueError(
-                "No mask_targets found on the dataset and "
-                "num_classes was not provided. Either set "
-                "dataset.mask_targets or provide num_classes."
+                f"Field '{label_field}' is not a Segmentation or "
+                "Detections field."
             )
+
+        logger.info(
+            "Label field '%s' has type %s", label_field, field_type,
+        )
+
+        if field_type == "Detections":
+            # Discover classes from distinct detection labels.
+            # Index 0 is reserved for background (unlabeled pixels).
+            distinct_labels = sorted(
+                target_view.distinct(
+                    f"{label_field}.detections.label",
+                )
+            )
+            if not distinct_labels:
+                raise ValueError(
+                    f"Detections field '{label_field}' has no "
+                    "labels.  Cannot build a class mapping."
+                )
+
+            id2label = {0: "background"}
+            label2id = {"background": 0}
+            for i, lbl in enumerate(distinct_labels, start=1):
+                id2label[i] = lbl
+                label2id[lbl] = i
+            num_labels = len(id2label)
+        else:
+            # Segmentation field — use mask_targets or fallback
+            mask_targets = None
+            if dataset.mask_targets:
+                mask_targets = dataset.mask_targets.get(label_field)
+            if mask_targets is None:
+                mask_targets = dataset.default_mask_targets or None
+
+            if mask_targets:
+                # mask_targets is {pixel_value: class_name}
+                id2label = {
+                    int(k): v for k, v in mask_targets.items()
+                }
+                label2id = {
+                    v: int(k) for k, v in mask_targets.items()
+                }
+                num_labels = len(mask_targets)
+            elif num_classes_override:
+                num_labels = num_classes_override
+                id2label = {i: str(i) for i in range(num_labels)}
+                label2id = {str(i): i for i in range(num_labels)}
+            else:
+                raise ValueError(
+                    "No mask_targets found on the dataset and "
+                    "num_classes was not provided.  Either set "
+                    "dataset.mask_targets or provide num_classes."
+                )
 
         if num_labels < 2:
             raise ValueError(
@@ -499,9 +803,20 @@ class FinetuneSegmentation(foo.Operator):
             train_view = target_view.select(sample_ids[:n_train])
             val_view = target_view.select(sample_ids[n_train:])
 
-        # Filter out samples with no segmentation mask
+        # Filter out samples with no label data
         train_view = train_view.exists(label_field)
         val_view = val_view.exists(label_field)
+
+        # For Detections fields, also exclude samples with zero
+        # detections (exists() only checks the field is not None).
+        if field_type == "Detections":
+            from fiftyone import ViewField as F
+
+            _has_dets = (
+                F(f"{label_field}.detections").length() > 0
+            )
+            train_view = train_view.match(_has_dets)
+            val_view = val_view.match(_has_dets)
 
         n_train = len(train_view)
         n_val = len(val_view)
@@ -544,11 +859,22 @@ class FinetuneSegmentation(foo.Operator):
         # Each sample has an image and a per-pixel mask.
         # The GetItem loads the image + mask and runs them through the
         # HuggingFace image processor.
+        #
+        # For Segmentation fields the mask is loaded directly (with
+        # support for both in-memory masks and on-disk mask_path).
+        # For Detections fields the per-instance masks are composited
+        # into a single semantic mask on the fly.
         # -----------------------------------------------------------------
         print("Building datasets...")
 
+        # Capture outer variables for the closure
+        _field_type = field_type
+        _label2id = label2id
+
         class _SegmentationGetItem(GetItem):
-            """Bridge from FiftyOne Segmentation to HF format.
+            """Bridge from FiftyOne labels to HF format.
+
+            Supports both ``Segmentation`` and ``Detections`` fields.
 
             Each sample is transformed into::
 
@@ -564,18 +890,30 @@ class FinetuneSegmentation(foo.Operator):
 
             @property
             def required_keys(self):
-                return ["filepath", "segmentation"]
+                return ["filepath", "label_data"]
 
             def __call__(self, d):
                 image = Image.open(d["filepath"]).convert("RGB")
-                seg_obj = d.get("segmentation")
+                label_data = d.get("label_data")
 
-                # seg_obj.mask is a numpy array of pixel class
-                # indices (H, W) with dtype uint8
-                mask = seg_obj.mask
+                if _field_type == "Detections":
+                    # Composite instance masks → semantic mask
+                    w_img, h_img = image.size
+                    mask = _detections_to_semantic_mask(
+                        label_data.detections,
+                        (h_img, w_img),
+                        _label2id,
+                    )
+                else:
+                    # Segmentation — handles both mask and
+                    # mask_path transparently
+                    mask = _load_mask_from_segmentation(
+                        label_data,
+                    )
 
-                # Convert mask to PIL Image for the processor
-                seg_map = Image.fromarray(mask)
+                seg_map = Image.fromarray(
+                    mask.astype(np.uint8),
+                )
 
                 inputs = self.proc(
                     images=image,
@@ -584,13 +922,11 @@ class FinetuneSegmentation(foo.Operator):
                 )
 
                 # Squeeze the batch dim the processor adds
-                result = {
+                return {
                     k: v.squeeze(0) for k, v in inputs.items()
                 }
 
-                return result
-
-        field_mapping = {"segmentation": label_field}
+        field_mapping = {"label_data": label_field}
 
         train_getter = _SegmentationGetItem(
             processor,
@@ -800,6 +1136,14 @@ class FinetuneSegmentation(foo.Operator):
         """Execute segmentation fine-tuning via the SDK through the
         operator framework.
 
+        The *label_field* may be either:
+
+        - A ``Segmentation`` field (in-memory ``mask`` or on-disk
+          ``mask_path``).
+        - A ``Detections`` field whose per-instance masks will be
+          composited into per-pixel semantic masks automatically (a
+          ``background`` class is added at index 0).
+
         In a notebook you must ``await`` the result::
 
             result = await segmentation_trainer(
@@ -812,14 +1156,17 @@ class FinetuneSegmentation(foo.Operator):
             sample_collection: a
                 :class:`fiftyone.core.collections.SampleCollection`
                 (Dataset or DatasetView) to train on.
-            label_field: the name of the ``Segmentation`` label field.
+            label_field: the name of the ``Segmentation`` or
+                ``Detections`` label field.
             model_name: any HuggingFace
                 ``AutoModelForSemanticSegmentation`` model ID.
             do_reduce_labels: whether to shift label IDs down by 1 and
                 treat pixel value 0 as background (set to ``True`` for
                 ADE20K-style datasets).
             num_classes: total number of classes. Required only when
-                ``mask_targets`` is not set on the dataset.
+                using a ``Segmentation`` field and ``mask_targets`` is
+                not set on the dataset.  Ignored for ``Detections``
+                fields (classes are discovered automatically).
             split_strategy: ``"percentage"`` or ``"tags"``.
             train_split: fraction of data for training (used when
                 ``split_strategy="percentage"``).
